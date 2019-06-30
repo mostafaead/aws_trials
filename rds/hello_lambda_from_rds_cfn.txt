@@ -1,0 +1,216 @@
+{
+    "AWSTemplateFormatVersion" : "2010-09-09",
+
+    "Description": "Stack to trigger Lambda from RDS for Oracle through API Gateway",
+
+    "Parameters" : {
+        "VpcId" : {
+            "Description" : "VPC where the RDS instance is created. API Gateway will allow traffic only from this VPC",
+            "Type" : "String",
+            "MinLength" :  "4",
+            "AllowedPattern" : "vpc-[a-z0-9]+"
+        },
+        "Subnet1" : {
+            "Description" : "Subnet in the same VPC as the RDS instance, where VPC Endpoint will be created",
+            "Type" : "String",
+            "MinLength" :  "7",
+            "AllowedPattern" : "subnet-[a-z0-9]+"
+        },
+        "Subnet2" : {
+            "Description" : "Subnet in the same VPC as the RDS instance, where VPC Endpoint will be created",
+            "Type" : "String",
+            "MinLength" :  "7",
+            "AllowedPattern" : "subnet-[a-z0-9]+"
+        },
+        "SecurityGroup" : {
+            "Description" : "Security group to allow inbound connections from the RDS instance to the VPC endpoint",
+            "Type" : "String",
+            "MinLength" :  "3",
+            "AllowedPattern" : "sg-[a-z0-9]+"  
+        }
+    },
+
+    "Resources": {
+        "LambdaExecutionRole" : {
+            "Type" : "AWS::IAM::Role",
+            "Properties" : {
+                "AssumeRolePolicyDocument" : {
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Principal": { "Service": "lambda.amazonaws.com"},
+                            "Action": "sts:AssumeRole"
+                        }
+                    ]
+                },
+                "ManagedPolicyArns" : [
+                    "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+                ]
+            }
+        },
+        "LambdaFunction" : {
+            "Type" : "AWS::Lambda::Function",
+            "DependsOn" : [ "LambdaExecutionRole" ],
+            "Properties": {
+                "Handler": "index.handler",
+                "Role": { "Fn::GetAtt" : [ "LambdaExecutionRole", "Arn" ] },
+                "Code": {
+                    "ZipFile" : { "Fn::Join" : ["\n", [
+                        "import json",
+                        "def handler(event, context):",
+                        "    print(\"Received event: \" + json.dumps(event, indent=4))",
+                        "    return \"Hello Lambda from RDS!\""
+                    ]]}
+                },
+                "Runtime": "python3.6",
+                "Timeout": 60
+            }
+        },
+
+        "PrivateApiGateway" : {
+            "Type" : "AWS::ApiGateway::RestApi",
+            "Properties": {
+                "Name" : "LambdaFromRDSInvoker",
+                "Description": "API used to proxy requests from RDS for Oracle to Lambda",
+                "FailOnWarnings": true,
+                "EndpointConfiguration" : {            
+                    "Types" : [ "PRIVATE" ]
+                },
+                "Policy" : {
+                   "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Effect": "Deny",
+                            "Principal": "*",
+                            "Action": "execute-api:Invoke",
+                            "Resource": { "Fn::Join" : ["", [
+                                "arn:aws:execute-api:", {"Ref": "AWS::Region"}, ":", {"Ref": "AWS::AccountId"}, ":*/*"
+                            ]]},
+                            "Condition": {
+                                "StringNotEquals": {
+                                    "aws:sourceVpc": { "Ref" : "VpcId"}
+                                }
+                            }
+                        },
+                        {
+                            "Effect": "Allow",
+                            "Principal": "*",
+                            "Action": "execute-api:Invoke",
+                            "Resource": { "Fn::Join" : ["", [
+                                "arn:aws:execute-api:", {"Ref": "AWS::Region"}, ":", {"Ref": "AWS::AccountId"}, ":*/*"
+                            ]]},
+                        }
+                    ]
+                }
+            }
+        },
+        "GrantPrivateApiGatewayToInvokeLambda" : {
+            "Type" : "AWS::Lambda::Permission",
+            "DependsOn" : [ "LambdaFunction", "PrivateApiGateway" ],
+            "Properties": {
+                "FunctionName": { "Fn::GetAtt" : [ "LambdaFunction", "Arn" ] },
+                "Action": "lambda:InvokeFunction",
+                "Principal": "apigateway.amazonaws.com",
+                "SourceArn": { "Fn::Join" : ["", [
+                    "arn:aws:execute-api:", {"Ref": "AWS::Region"}, ":", {"Ref": "AWS::AccountId"}, ":",
+                    {"Ref": "PrivateApiGateway"}, "/*"
+                ]]}
+            }
+        },
+        "ApiGatewayCloudWatchLogsRole": {
+            "Type" : "AWS::IAM::Role",
+            "Properties": {
+                "AssumeRolePolicyDocument": {
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Principal": { "Service": "apigateway.amazonaws.com" },
+                            "Action": "sts:AssumeRole"
+                        }
+                    ]
+                },
+                "ManagedPolicyArns" : [
+                   "arn:aws:iam::aws:policy/CloudWatchLogsFullAccess"
+                ]
+            }
+        },
+        "ApiGatewayAccount": {
+            "Type" : "AWS::ApiGateway::Account",
+            "DependsOn" : [ "ApiGatewayCloudWatchLogsRole" ],
+            "Properties": {
+                "CloudWatchRoleArn": { "Fn::GetAtt" : [ "ApiGatewayCloudWatchLogsRole", "Arn" ] }
+            }
+        },
+        "ApiGatewayResource": {
+            "Type" : "AWS::ApiGateway::Resource",
+            "DependsOn" : [ "PrivateApiGateway" ],
+            "Properties" : {
+                "RestApiId" : { "Ref" : "PrivateApiGateway" },
+                "ParentId" : { "Fn::GetAtt" : [ "PrivateApiGateway", "RootResourceId"]},
+                "PathPart" : "lambdainvoker"
+            }
+        },
+        "PrivateApiGatewayInvokeLambda" : {
+            "Type" : "AWS::ApiGateway::Method",
+            "DependsOn" : [ "ApiGatewayResource", "PrivateApiGateway", "GrantPrivateApiGatewayToInvokeLambda" ],
+            "Properties" : {
+                "AuthorizationType" : "NONE",
+                "HttpMethod" : "GET",
+                "Integration": {
+                    "Type" : "AWS",
+                    "IntegrationHttpMethod" : "POST",
+                    "Uri": { "Fn::Join" : ["", [
+                        "arn:aws:apigateway:", {"Ref": "AWS::Region"}, ":lambda:path/2015-03-31/functions/", {"Fn::GetAtt": [ "LambdaFunction", "Arn" ]}, "/invocations"
+                    ]]},
+                    "IntegrationResponses": [ { "StatusCode": 200 } ],
+                },
+                "ResourceId" : { "Ref" : "ApiGatewayResource" },
+                "RestApiId": { "Ref" : "PrivateApiGateway"},
+                "MethodResponses": [ {"StatusCode": 200} ]
+            }
+        },
+        "ApiGatewayDeployment" : {
+            "Type" : "AWS::ApiGateway::Deployment",
+            "DependsOn" : [ "ApiGatewayAccount", "PrivateApiGateway", "PrivateApiGatewayInvokeLambda" ],
+            "Properties" : {
+                "RestApiId" : { "Ref": "PrivateApiGateway" },
+                "StageName" : "dev",
+                "StageDescription" : {
+                    "MethodSettings" : [
+                        {
+                            "DataTraceEnabled" : true,
+                            "HttpMethod" : "*",
+                            "LoggingLevel" : "INFO",
+                            "ResourcePath": "/*"
+                        }
+                    ]
+                }
+            }
+        },
+
+        "VpcEndpoint" : {
+            "Type" : "AWS::EC2::VPCEndpoint",
+            "Properties" : {
+                "VpcId" : { "Ref" : "VpcId" },
+                "ServiceName" : { "Fn::Join" : ["", ["com.amazonaws.", {"Ref": "AWS::Region"}, ".execute-api"]]},
+                "VpcEndpointType" : "Interface",
+                "PrivateDnsEnabled" : true,
+                "SubnetIds" : [ { "Ref" : "Subnet1" } , { "Ref" : "Subnet2" } ],
+                "SecurityGroupIds" : [ { "Ref" : "SecurityGroup" } ]
+            }
+        }
+    },
+    "Outputs" : {
+        "CurlTest" : {
+            "Value" : { "Fn::Join" : ["", [
+                "curl https://",
+                { "Fn::Select" : [ "1", { "Fn::Split" : [ ":", { "Fn::Select" : ["0", { "Fn::GetAtt" : [ "VpcEndpoint", "DnsEntries" ] } ] } ] } ] },
+                "/dev/lambdainvoker  --header \"x-apigw-api-id: ",
+                { "Ref" : "PrivateApiGateway" },
+                "\""
+            ]]}
+        }
+    }
+}
